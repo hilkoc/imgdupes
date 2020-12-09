@@ -12,7 +12,7 @@ import time
 import zlib
 from io import BytesIO
 from multiprocessing import Pool
-from subprocess import check_call
+from subprocess import check_call, DEVNULL
 from collections import defaultdict 
 
 import gi
@@ -23,7 +23,7 @@ from PIL import Image
 gi.require_version("GExiv2", "0.10")
 from gi.repository.GExiv2 import Metadata
 
-VERSION = "2.0"
+VERSION = "2.1"
 
 JPEG_CACHE_FILE = "/.jpghashes" # was called "/.signatures"
 
@@ -71,9 +71,8 @@ def hashcalc(path, pool, method="MD5", havejpeginfo=False):
     # Check file integrity using jpeginfo if available
     if havejpeginfo:
         try:
-            devnull = open(os.devnull, "w")
             check_call(
-                ["jpeginfo", "-c", path], stdout=devnull, stderr=devnull
+                ["jpeginfo", "-c", path], stdout=DEVNULL, stderr=DEVNULL
             )
         except:
             sys.stderr.write("     Corrupt JPEG, skipping\n")
@@ -96,13 +95,14 @@ def hashcalc(path, pool, method="MD5", havejpeginfo=False):
             "    *** Error reading image data, it will be ignored\n"
         )
         return ["ERR"]
-
+    del lista
+    del img
     return results
 
 
 # Writes the specified dict to disk
-def writecache(d, args, fsigs):
-    if not args.clean:
+def writecache(d, clean, fsigs):
+    if not clean:
         cache = open(fsigs, "wb")
         pickle.dump(d, cache)
         cache.close()
@@ -237,7 +237,12 @@ def parse_cmdline():
     parser = argparse.ArgumentParser(
         description="Checks for duplicated images in a directory tree. Compares just image data, metadata is ignored, so physically different files may be reported as duplicates if they have different metadata (tags, titles, JPEG rotation, EXIF info...)."
     )
-    parser.add_argument("directory", help="Base directory to check")
+    parser.add_argument("directory", help="Base directory to check. When filtering against library folder, this is the directory from which files will be deleted.")
+    parser.add_argument(
+        "--library",
+        help="Optional. If library directory exists, files from directory that also exist in library, will be deleted from directory.",
+        required=False,
+    )
     parser.add_argument(
         "-1",
         "--sameline",
@@ -283,8 +288,7 @@ def parse_cmdline():
 def is_jpeginfo_installed():
     havejpeginfo = True
     try:
-        devnull = open(os.devnull, "w")
-        check_call(["jpeginfo", "--version"], stdout=devnull, stderr=devnull)
+        check_call(["jpeginfo", "--version"], stdout=DEVNULL, stderr=DEVNULL)
         sys.stderr.write(
             "jpeginfo found in system, will be used to check JPEG file integrity\n"
         )
@@ -296,14 +300,13 @@ def is_jpeginfo_installed():
     return havejpeginfo
 
 
-def load_hashes(rootDir):
+def load_hashes(fsigs):
     # Reload hash data from previous run, if it exists
     
     jpegs = {}
     # This flag indicates if there is anything to update in the cache
     modif = False
 
-    fsigs = rootDir + JPEG_CACHE_FILE
     if os.path.isfile(fsigs):
         cache = open(fsigs, "rb")
         try:
@@ -330,7 +333,7 @@ def load_hashes(rootDir):
     return jpegs, modif
 
 
-def calculate_hashes(rootDir, jpegs, modif, havejpeginfo, hash_method):
+def calculate_hashes(rootDir, jpegs, modif, havejpeginfo, fsigs, clean, hash_method):
     # Create process pool for parallel hash calculation
     pool = Pool()
     # Allowed extensions (case insensitive)
@@ -341,7 +344,7 @@ def calculate_hashes(rootDir, jpegs, modif, havejpeginfo, hash_method):
         for fname in fileList:
             # Update signatures cache every 100 files
             if modif and ((count % 100) == 0):
-                writecache(jpegs, args, fsigs)
+                writecache(jpegs, clean, fsigs)
                 modif = False
             if fname.lower().endswith(extensions):
                 filepath = os.path.join(dirName, fname)
@@ -362,12 +365,17 @@ def calculate_hashes(rootDir, jpegs, modif, havejpeginfo, hash_method):
                     }
                     modif = True
                     count += 1
+    pool.close()
     return jpegs, modif, count
 
 
-def get_hashes(rootDir, havejpeginfo, hash_method):
-    jpegs, modif = load_hashes(rootDir)
-    jpegs, modif, count = calculate_hashes(rootDir, jpegs, modif, havejpeginfo, hash_method)
+def get_hashes(rootDir, havejpeginfo, hash_method, clean):
+    fsigs = rootDir + JPEG_CACHE_FILE
+    jpegs, modif = load_hashes(fsigs)
+    jpegs, modif, count = calculate_hashes(rootDir, jpegs, modif, havejpeginfo, fsigs, clean, hash_method)
+    # Write hash cache to disk
+    if modif:
+        writecache(jpegs, clean, fsigs)
     return jpegs, modif, count
 
 
@@ -390,12 +398,7 @@ def jpegdupes(args):
         exit(1)
 
     rootDir = "."
-    jpegs, modif, count = get_hashes(rootDir, havejpeginfo, args.method)
-    
-
-    # Write hash cache to disk
-    if modif:
-        writecache(jpegs, args, fsigs)
+    jpegs, modif, count = get_hashes(rootDir, havejpeginfo, args.method, args.clean)
 
     # Check for duplicates
 
@@ -522,7 +525,7 @@ def jpegdupes(args):
                 elif answer in ["quit", "q"]:
                     # If asked, write changes, delete temps and quit
                     if modif:
-                        writecache(jpegs, args, fsigs)
+                        writecache(jpegs, args.clean, fsigs)
                     rmtemps(tmpdirs)
                     exit(0)
                 elif answer in ["show", "s"]:
@@ -573,7 +576,7 @@ def jpegdupes(args):
 
     # Final update of the cache in order to remove signatures of deleted files
     if modif:
-        writecache(jpegs, args, fsigs)
+        writecache(jpegs, args.clean, fsigs)
 
     # Delete temps
     rmtemps(tmpdirs)
@@ -582,37 +585,49 @@ def jpegdupes(args):
     os.chdir(pwd)
 
 
-def filterfolder(tofilter, library):
+def filterfolder(tofilter, library, delete, hash_method="MD5", clean=False):
     """ Scan the tofilter folder and remove any jpegs from there that exist in the library folder as well, ignoring metadata.
         Nothing will be deleted from the library folder.
     """
     
     havejpeginfo = is_jpeginfo_installed()
-    hash_method = "MD5"
+    
     # calculate hashes or load from file for tofilter dir
     # calculate hashes or load from file for library dir
 
 
-    jpegs_tofilter, _ , tofilter_count = get_hashes(tofilter, havejpeginfo, hash_method)  # jpegs, modif, count
-    jpegs_library, _ , library_count = get_hashes(library, havejpeginfo, hash_method)    # jpegs, modif, count
+    jpegs_tofilter, _ , tofilter_count = get_hashes(tofilter, havejpeginfo, hash_method, clean)  # jpegs, modif, count
+    jpegs_library, _ , library_count = get_hashes(library, havejpeginfo, hash_method, clean)    # jpegs, modif, count
     hashes_library = [h for jpeg in jpegs_library.values() for h in jpeg['hash']]
 
+    if not delete:
+        sys.stderr.write("No files will be deleted, only printed instead. Run with --delelte to delete")
+    sys.stderr.write("Files to be deleted:")
+
+    delete_count = 0
     # for each hash in tofilter dir, if it exist in library, delete the corresponding file from tofilter dir
     for fpath, jpeg in jpegs_tofilter.items():
         # print(f"{fpath} -> {jpeg}")
         for h in jpeg['hash']:
             if h in hashes_library:
-                print(f"deleting {jpeg['name']}")
-                os.remove(fpath)
+                delete_count += 1
+                print(jpeg['name'])
+                # print(fpath)
+                if delete:
+                    os.remove(fpath)
                 break
 
     # print summary
-    print(f"tofilter count {tofilter_count},  library count {library_count}")
+    sys.stderr.write(f"nr hashes calculated- tofilter: {tofilter_count},  library: {library_count}")
+    sys.stderr.write(f"Nr files deleted {delete_count}")
 
 
 def main():
     args = parse_cmdline()
-    jpegdupes(args)
+    if args.library is not None:
+        filterfolder(args.directory, args.library, args.delete, args.method, args.clean)
+    else:
+        jpegdupes(args)
 
 
 # Execute main if called as a script

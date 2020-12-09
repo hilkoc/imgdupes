@@ -26,15 +26,16 @@ class TestFilterFolder(unittest.TestCase):
         shutil.rmtree(cls.TOFILTER_DIR)
 
 
-    def test_ok(self):
+    def test_filterfolder(self):
         tofilter = self.TOFILTER_DIR
         library = self.LIBRARY_DIR
         print(dir(jpegdupes))
 
-        jpegdupes.jpegdupes.filterfolder(tofilter, library)
+        jpegdupes.jpegdupes.filterfolder(tofilter, library, delete=True)
         # for img in ("/donatello2.jpg", "/Raphael2.jpeg", "/mikey.jpg"):
             # os.remove(self.TOFILTER_DIR + img)
 
+        self.assertTrue(os.path.isfile(self.TOFILTER_DIR + "/.jpghashes"))
         self.assertTrue(os.path.isfile(self.TOFILTER_DIR + "/leo.jpg"))
         for img in ("/donatello2.jpg", "/Raphael2.jpeg", "/mikey.jpg"):
             self.assertFalse(os.path.isfile(self.TOFILTER_DIR + img), img)
