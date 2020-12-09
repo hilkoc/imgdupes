@@ -13,6 +13,7 @@ import zlib
 from io import BytesIO
 from multiprocessing import Pool
 from subprocess import check_call
+from collections import defaultdict 
 
 import gi
 import texttable as tt
@@ -23,6 +24,8 @@ gi.require_version("GExiv2", "0.10")
 from gi.repository.GExiv2 import Metadata
 
 VERSION = "2.0"
+
+JPEG_CACHE_FILE = "/.jpghashes" # was called "/.signatures"
 
 
 # Calculates hash of the specified object x. x is a tuple with the format
@@ -63,7 +66,7 @@ def phash(x):
 # Just image data, ignore headers
 # Uses a process pool to benefit from multiple cores
 def hashcalc(path, pool, method="MD5", havejpeginfo=False):
-    rots = [0, 90, 180, 270]
+    rotations = [0, 90, 180, 270]
 
     # Check file integrity using jpeginfo if available
     if havejpeginfo:
@@ -78,14 +81,14 @@ def hashcalc(path, pool, method="MD5", havejpeginfo=False):
 
     try:
         img = JPEGImage(path)
-        lista = []
-        for rot in rots:
-            lista.append((img, rot, method))
     except IOError:
         sys.stderr.write(
             "    *** Error opening file %s, file will be ignored\n" % path
         )
         return ["ERR"]
+    else:
+        lista = [(img, rot, method) for rot in rotations]
+
     try:
         results = pool.map(phash, lista)
     except:
@@ -229,9 +232,8 @@ def metadata_summary(path):
 
     return dinfo
 
-
-def main():
-    # The first, and only argument needs to be a directory
+def parse_cmdline():
+    # The first, and only mandatory argument needs to be a directory
     parser = argparse.ArgumentParser(
         description="Checks for duplicated images in a directory tree. Compares just image data, metadata is ignored, so physically different files may be reported as duplicates if they have different metadata (tags, titles, JPEG rotation, EXIF info...)."
     )
@@ -275,17 +277,10 @@ def main():
     parser.add_argument(
         "--version", action="version", version="%(prog)s " + VERSION
     )
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    if args.auto and not args.delete:
-        sys.stderr.write(
-            "'-a' or '--auto' only makes sense when deleting files with '-d' or '--delete'\n"
-        )
-        exit(1)
 
-    pwd = os.getcwd()
-
-    # Check if jpeginfo is installed
+def is_jpeginfo_installed():
     havejpeginfo = True
     try:
         devnull = open(os.devnull, "w")
@@ -298,24 +293,17 @@ def main():
             "jpeginfo not found in system, please install it for smarter JPEG file integrity detection\n"
         )
         havejpeginfo = False
+    return havejpeginfo
 
-    try:
-        os.chdir(args.directory)
-    except:
-        sys.stderr.write("Directory %s doesn't exist\n" % args.directory)
-        exit(1)
 
-    # Extensiones admitidas (case insensitive)
-    extensiones = ("jpg", "jpeg")
-
-    # Diccionario con información sobre los ficheros
+def load_hashes(rootDir):
+    # Reload hash data from previous run, if it exists
+    
     jpegs = {}
-    # Flag para saber si hay que volver a escribir la caché por cambios
+    # This flag indicates if there is anything to update in the cache
     modif = False
 
-    # Recuperar información de los ficheros generada previamente, si existe
-    rootDir = "."
-    fsigs = ".signatures"
+    fsigs = rootDir + JPEG_CACHE_FILE
     if os.path.isfile(fsigs):
         cache = open(fsigs, "rb")
         try:
@@ -323,7 +311,7 @@ def main():
             jpegs = pickle.load(file=cache)
             cache.close()
             # Clean up non-existing entries
-            sys.stderr.write("Cleaning up deleted files from cache...\n")
+            sys.stderr.write("Updating cache, removing deleted files from cache...\n")
             jpegs = dict(
                 [x for x in iter(jpegs.items()) if os.path.exists(x[0])]
             )
@@ -339,11 +327,15 @@ def main():
             jpegs = {}
             modif = True
             cache.close()
+    return jpegs, modif
 
+
+def calculate_hashes(rootDir, jpegs, modif, havejpeginfo, hash_method):
     # Create process pool for parallel hash calculation
     pool = Pool()
-
-    count = 1
+    # Allowed extensions (case insensitive)
+    extensions = ("jpg", "jpeg")
+    count = 0
     for dirName, subdirList, fileList in os.walk(rootDir):
         sys.stderr.write("Exploring %s\n" % dirName)
         for fname in fileList:
@@ -351,25 +343,55 @@ def main():
             if modif and ((count % 100) == 0):
                 writecache(jpegs, args, fsigs)
                 modif = False
-            if fname.lower().endswith(extensiones):
-                ruta = os.path.join(dirName, fname)
+            if fname.lower().endswith(extensions):
+                filepath = os.path.join(dirName, fname)
                 # Si el fichero no está en la caché,
                 # o está pero con tamaño diferente, añadirlo
-                if (ruta not in jpegs) or (
-                    (ruta in jpegs)
-                    and (jpegs[ruta]["size"] != os.path.getsize(ruta))
+                if (filepath not in jpegs) or (
+                    (filepath in jpegs)
+                    and (jpegs[filepath]["size"] != os.path.getsize(filepath))
                 ):
-                    sys.stderr.write("   Calculating hash of %s...\n" % ruta)
-                    jpegs[ruta] = {
+                    sys.stderr.write("   Calculating hash of %s...\n" % filepath)
+                    jpegs[filepath] = {
                         "name": fname,
                         "dir": dirName,
                         "hash": hashcalc(
-                            ruta, pool, args.method, havejpeginfo
+                            filepath, pool, hash_method, havejpeginfo
                         ),
-                        "size": os.path.getsize(ruta),
+                        "size": os.path.getsize(filepath),
                     }
                     modif = True
                     count += 1
+    return jpegs, modif, count
+
+
+def get_hashes(rootDir, havejpeginfo, hash_method):
+    jpegs, modif = load_hashes(rootDir)
+    jpegs, modif, count = calculate_hashes(rootDir, jpegs, modif, havejpeginfo, hash_method)
+    return jpegs, modif, count
+
+
+def jpegdupes(args):
+    if args.auto and not args.delete:
+        sys.stderr.write(
+            "'-a' or '--auto' only makes sense when deleting files with '-d' or '--delete'\n"
+        )
+        exit(1)
+
+    pwd = os.getcwd()
+
+    # Check if jpeginfo is installed
+    havejpeginfo = is_jpeginfo_installed()
+
+    try:
+        os.chdir(args.directory)
+    except:
+        sys.stderr.write("Directory %s doesn't exist\n" % args.directory)
+        exit(1)
+
+    rootDir = "."
+    jpegs, modif, count = get_hashes(rootDir, havejpeginfo, args.method)
+    
 
     # Write hash cache to disk
     if modif:
@@ -378,16 +400,15 @@ def main():
     # Check for duplicates
 
     # Create a new dict indexed by hash
-    # Initialize dict with an empty list for every possible hash
-    hashes = {}
-    for f in jpegs:
-        for h in jpegs[f]["hash"]:
-            hashes[h] = []
+    hashes = defaultdict(list)
+    
     # Group files with the same hash together
     for f in jpegs:
         for h in jpegs[f]["hash"]:
             hashes[h].append(jpegs[f])
+
     # Discard hashes without duplicates
+
     dupes = {}
     for h in hashes:
         if len(hashes[h]) > 1:
@@ -559,6 +580,39 @@ def main():
 
     # Restore directory
     os.chdir(pwd)
+
+
+def filterfolder(tofilter, library):
+    """ Scan the tofilter folder and remove any jpegs from there that exist in the library folder as well, ignoring metadata.
+        Nothing will be deleted from the library folder.
+    """
+    
+    havejpeginfo = is_jpeginfo_installed()
+    hash_method = "MD5"
+    # calculate hashes or load from file for tofilter dir
+    # calculate hashes or load from file for library dir
+
+
+    jpegs_tofilter, _ , tofilter_count = get_hashes(tofilter, havejpeginfo, hash_method)  # jpegs, modif, count
+    jpegs_library, _ , library_count = get_hashes(library, havejpeginfo, hash_method)    # jpegs, modif, count
+    hashes_library = [h for jpeg in jpegs_library.values() for h in jpeg['hash']]
+
+    # for each hash in tofilter dir, if it exist in library, delete the corresponding file from tofilter dir
+    for fpath, jpeg in jpegs_tofilter.items():
+        # print(f"{fpath} -> {jpeg}")
+        for h in jpeg['hash']:
+            if h in hashes_library:
+                print(f"deleting {jpeg['name']}")
+                os.remove(fpath)
+                break
+
+    # print summary
+    print(f"tofilter count {tofilter_count},  library count {library_count}")
+
+
+def main():
+    args = parse_cmdline()
+    jpegdupes(args)
 
 
 # Execute main if called as a script
